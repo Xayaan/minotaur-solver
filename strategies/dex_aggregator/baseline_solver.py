@@ -1498,16 +1498,32 @@ class BaselineSwapSolver(IntentSolver):
                 candidates,
                 key=lambda c: (self._route_gas_rank(c[2]), -c[0], c[1]),
             )
-        best_output = max(out for out, _, _ in candidates)
-        # Output-vs-quote contributes 80%, gas 20%. A ~100k gas delta is worth
-        # about two final-score points, so do not pay it for a few-bps output
-        # improvement. Keep a 4% guardrail to avoid sacrificing real price edge.
-        floor = best_output * 9600 // 10000
-        near_best = [c for c in candidates if c[0] >= floor]
-        return min(
-            near_best,
-            key=lambda c: (self._route_gas_rank(c[2]), -c[0], c[1]),
+        # Reference-anchored scoring rewards realized output against a fixed
+        # quote. Do not trade away output for a lower-gas route here: the gas
+        # component is capped at 20%, while every missed output wei directly
+        # weakens both JS and scoreIntent output signals.
+        return max(
+            candidates,
+            key=lambda c: (c[0], -self._route_gas_rank(c[2]), c[1]),
         )
+
+    def _prefer_aerodrome_for_token_pair(
+        self,
+        token_in: str,
+        token_out: str,
+        chain_id: int,
+    ) -> bool:
+        """AERO liquidity on Base is primarily Aerodrome.
+
+        When exact quoting is unavailable or partially timed out, the fallback
+        single-tick math can pick a thin Uniswap AERO pool that later reverts
+        with "Too little received". Prefer same-DEX Aerodrome routes for AERO
+        pairs so fallback behavior matches live liquidity.
+        """
+        if int(chain_id or 0) != 8453:
+            return False
+        aero = "0x940181a94a35a4569e4529a3cdfb74e38fd98631"
+        return token_in.lower() == aero or token_out.lower() == aero
 
     def _find_best_executable_route(
         self,
@@ -1564,8 +1580,15 @@ class BaselineSwapSolver(IntentSolver):
         v3_only = {a: p for a, p in pool_states.items() if (p.get("dex") or "uniswap_v3") == "uniswap_v3"}
         aero_only = {a: p for a, p in pool_states.items() if p.get("dex") == "aerodrome_slipstream"}
 
+        subset_order = (
+            (aero_only, v3_only)
+            if self._prefer_aerodrome_for_token_pair(token_in, token_out, chain_id)
+            else (v3_only, aero_only)
+        )
+
+        prefer_aero = self._prefer_aerodrome_for_token_pair(token_in, token_out, chain_id)
         candidates = []
-        for subset in (v3_only, aero_only):
+        for subset in subset_order:
             if not subset:
                 continue
             r = find_best_route(
@@ -1576,6 +1599,15 @@ class BaselineSwapSolver(IntentSolver):
                 candidates.append(r)
 
         if candidates:
+            if prefer_aero:
+                aero_candidates = [
+                    c for c in candidates
+                    if self._dominant_dex(c[2]) == "aerodrome_slipstream"
+                ]
+                if aero_candidates:
+                    return self._choose_score_aware_route(
+                        aero_candidates, prefer_gas=prefer_gas,
+                    )
             return self._choose_score_aware_route(candidates, prefer_gas=prefer_gas)
 
         # Nothing single-DEX viable — try direct only across all pools.
