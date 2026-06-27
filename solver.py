@@ -58,9 +58,9 @@ from minotaur_subnet.shared.types import (
 
 logger = logging.getLogger(__name__)
 
-SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "17.0.0")
-SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
+SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "top-miner-router")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "0.2.0")
+SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "Xayaan")
 
 # Base hub tokens — the pairs the benchmark trades against.
 _WETH_BASE = "0x4200000000000000000000000000000000000006"
@@ -222,10 +222,18 @@ class MinerSolver(BaselineSwapSolver):
             control = state.control_view()
             raw = state.raw_params_view()
             has_reference_quote = raw.get("quoted_output") not in (None, "", "0", 0)
+            token_in = str(swap_params.get("input_token", "") or "").lower()
+            token_out = str(swap_params.get("output_token", "") or "").lower()
+            gas_safe_pairs = {
+                (_WETH_BASE.lower(), _USDC_BASE.lower()),
+                (_USDC_BASE.lower(), _WETH_BASE.lower()),
+                (_CBBTC_BASE.lower(), _WETH_BASE.lower()),
+            }
             if (
                 not for_quote
                 and control.get("_stage") in ("synthetic", "historical")
                 and has_reference_quote
+                and (token_in, token_out) in gas_safe_pairs
             ):
                 return True
         except Exception:
