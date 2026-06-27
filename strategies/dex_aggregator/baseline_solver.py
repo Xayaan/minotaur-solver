@@ -1427,59 +1427,50 @@ class BaselineSwapSolver(IntentSolver):
         quoting for correctness, but pick the lower-gas candidate when its
         output is within 4% of the best output.
         """
-        from strategies.dex_aggregator.quoter import make_quote_fn, resolve_best_route
+        from strategies.dex_aggregator import quoter as _quoter
 
         w3 = self._get_web3(chain_id)
-        quote_hop = make_quote_fn(w3, chain_id)
+        quote_hop = _quoter.make_quote_fn(w3, chain_id)
         intermediaries = self._intermediaries_for_chain(chain_id)
+        routes = _quoter.enumerate_candidate_routes(
+            pool_states, token_in, token_out, intermediaries,
+        )
+        routes = [r for r in routes if self._is_executable_route(r, chain_id)]
+        routes.sort(key=_quoter.route_bottleneck_liquidity, reverse=True)
+
         candidates: list[tuple[int, str, list[dict[str, Any]]]] = []
-        seen: set[tuple[str, ...]] = set()
-        last_exc: Exception | None = None
-
-        def _pool_dex(ps: dict[str, Any]) -> str:
-            return ps.get("dex") or "uniswap_v3"
-
-        def _add_candidate(states: dict[str, dict[str, Any]]) -> None:
-            nonlocal last_exc
-            if not states:
-                return
+        quoted = 0
+        attempted = 0
+        last_skip: Exception | None = None
+        for route in routes:
+            if quoted >= _quoter.MAX_QUOTE_CANDIDATES:
+                break
+            attempted += 1
             try:
-                result = resolve_best_route(
-                    quote_hop,
-                    states,
-                    token_in,
-                    token_out,
-                    amount_in,
-                    intermediaries=intermediaries,
-                    is_executable=lambda route: self._is_executable_route(route, chain_id),
-                )
-            except Exception as exc:  # noqa: BLE001 - another subset may still quote
-                last_exc = exc
-                return
-            hops = result[2]
-            key = tuple(
-                (
-                    self._hop_dex(h),
-                    str(h.get("token_in") or h.get("from") or ""),
-                    str(h.get("token_out") or h.get("to") or ""),
-                    str(h.get("fee") or h.get("tick_spacing") or ""),
-                    str(h.get("pool") or h.get("address") or h.get("pool_address") or ""),
-                )
-                for h in hops
-            )
-            if key in seen:
-                return
-            seen.add(key)
-            candidates.append(result)
+                amounts = _quoter.quote_route(quote_hop, route, amount_in)
+            except _quoter.QuoteHopError as exc:
+                last_skip = exc
+                continue
 
-        _add_candidate(pool_states)
-        for dex in ("uniswap_v3", "aerodrome_slipstream"):
-            _add_candidate({k: v for k, v in pool_states.items() if _pool_dex(v) == dex})
+            quoted += 1
+            final_out = amounts[-1]
+            priced: list[dict[str, Any]] = []
+            current_in = int(amount_in)
+            for hop, out in zip(route, amounts):
+                priced_hop = dict(hop)
+                priced_hop["amount_in"] = current_in
+                priced_hop["amount_out"] = out
+                priced.append(priced_hop)
+                current_in = out
+            candidates.append((final_out, _quoter._route_description(route), priced))
 
         if not candidates:
-            if last_exc is not None:
-                raise last_exc
-            raise ValueError(f"No route found for {token_in} -> {token_out}")
+            raise _quoter.NoRouteError(
+                f"no quotable route for {token_in[:10]}->{token_out[:10]} "
+                f"(attempted {attempted} candidate(s)"
+                + (f"; last skip: {last_skip}" if last_skip else "")
+                + ")"
+            )
         return self._choose_score_aware_route(candidates, prefer_gas=prefer_gas)
 
     def _route_gas_rank(self, hops: list[dict[str, Any]]) -> int:
