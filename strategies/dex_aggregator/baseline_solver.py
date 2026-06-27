@@ -1320,7 +1320,7 @@ class BaselineSwapSolver(IntentSolver):
     def _hop_dex(hop: dict[str, Any]) -> str:
         """Return the DEX tag for a hop. Defaults to ``uniswap_v3`` for
         legacy/snapshot-sourced pools that predate the ``dex`` marker."""
-        return (hop.get("pool_state") or {}).get("dex") or "uniswap_v3"
+        return hop.get("dex") or (hop.get("pool_state") or {}).get("dex") or "uniswap_v3"
 
     @classmethod
     def _dominant_dex(cls, hops: list[dict[str, Any]]) -> str:
@@ -1329,6 +1329,130 @@ class BaselineSwapSolver(IntentSolver):
         if all(cls._hop_dex(h) == "aerodrome_slipstream" for h in hops):
             return "aerodrome_slipstream"
         return "uniswap_v3"
+
+    def _is_executable_route(self, hops: list[dict[str, Any]], chain_id: int) -> bool:
+        """Whether this solver can emit calldata for the resolved route."""
+        if not hops:
+            return False
+        if len(hops) <= 1:
+            dex = self._hop_dex(hops[0])
+            if dex == "aerodrome_slipstream":
+                from strategies.dex_aggregator import aerodrome as _aero
+                return chain_id in _aero.AERODROME_SLIPSTREAM_ROUTER
+            if dex == "uniswap_v3":
+                from strategies.dex_aggregator.swap_solver import UNISWAP_V3_ROUTERS
+                return chain_id in UNISWAP_V3_ROUTERS
+            return False
+        dexes = {self._hop_dex(h) for h in hops}
+        if len(dexes) != 1:
+            return False
+        dex = next(iter(dexes))
+        if dex == "aerodrome_slipstream":
+            from strategies.dex_aggregator import aerodrome as _aero
+            return chain_id in _aero.AERODROME_SLIPSTREAM_ROUTER
+        if dex == "uniswap_v3":
+            from strategies.dex_aggregator.swap_solver import UNISWAP_V3_ROUTERS
+            return chain_id in UNISWAP_V3_ROUTERS
+        return False
+
+    def _resolve_best_route(
+        self,
+        pool_states: dict[str, dict[str, Any]],
+        token_in: str,
+        token_out: str,
+        amount_in: int,
+        chain_id: int,
+    ) -> tuple[int, str, list[dict[str, Any]]]:
+        """Resolve the best executable route with on-chain Quoter exact output.
+
+        The raw best-output route can lose score on Base when Aerodrome only
+        beats Uniswap by a few bps but costs materially more gas. Keep exact
+        quoting for correctness, but pick the lower-gas candidate when its
+        output is within 4% of the best output.
+        """
+        from strategies.dex_aggregator.quoter import make_quote_fn, resolve_best_route
+
+        w3 = self._get_web3(chain_id)
+        quote_hop = make_quote_fn(w3, chain_id)
+        intermediaries = self._intermediaries_for_chain(chain_id)
+        candidates: list[tuple[int, str, list[dict[str, Any]]]] = []
+        seen: set[tuple[str, ...]] = set()
+        last_exc: Exception | None = None
+
+        def _pool_dex(ps: dict[str, Any]) -> str:
+            return ps.get("dex") or "uniswap_v3"
+
+        def _add_candidate(states: dict[str, dict[str, Any]]) -> None:
+            nonlocal last_exc
+            if not states:
+                return
+            try:
+                result = resolve_best_route(
+                    quote_hop,
+                    states,
+                    token_in,
+                    token_out,
+                    amount_in,
+                    intermediaries=intermediaries,
+                    is_executable=lambda route: self._is_executable_route(route, chain_id),
+                )
+            except Exception as exc:  # noqa: BLE001 - another subset may still quote
+                last_exc = exc
+                return
+            hops = result[2]
+            key = tuple(
+                (
+                    self._hop_dex(h),
+                    str(h.get("token_in") or h.get("from") or ""),
+                    str(h.get("token_out") or h.get("to") or ""),
+                    str(h.get("fee") or h.get("tick_spacing") or ""),
+                    str(h.get("pool") or h.get("address") or h.get("pool_address") or ""),
+                )
+                for h in hops
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(result)
+
+        _add_candidate(pool_states)
+        for dex in ("uniswap_v3", "aerodrome_slipstream"):
+            _add_candidate({k: v for k, v in pool_states.items() if _pool_dex(v) == dex})
+
+        if not candidates:
+            if last_exc is not None:
+                raise last_exc
+            raise ValueError(f"No route found for {token_in} -> {token_out}")
+        return self._choose_score_aware_route(candidates)
+
+    def _route_gas_rank(self, hops: list[dict[str, Any]]) -> int:
+        """Approximate relative gas for route choice only."""
+        dex = self._dominant_dex(hops)
+        hop_count = max(1, len(hops))
+        if dex == "uniswap_v3":
+            if hop_count == 1:
+                return 360_000
+            return 465_000 + 75_000 * (hop_count - 2)
+        if dex == "aerodrome_slipstream":
+            if hop_count == 1:
+                return 455_000
+            return 650_000 + 95_000 * (hop_count - 2)
+        return 600_000 + 100_000 * (hop_count - 1)
+
+    def _choose_score_aware_route(
+        self,
+        candidates: list[tuple[int, str, list[dict[str, Any]]]],
+    ) -> tuple[int, str, list[dict[str, Any]]]:
+        best_output = max(out for out, _, _ in candidates)
+        # Output-vs-quote contributes 80%, gas 20%. A ~100k gas delta is worth
+        # about two final-score points, so do not pay it for a few-bps output
+        # improvement. Keep a 4% guardrail to avoid sacrificing real price edge.
+        floor = best_output * 9600 // 10000
+        near_best = [c for c in candidates if c[0] >= floor]
+        return min(
+            near_best,
+            key=lambda c: (self._route_gas_rank(c[2]), -c[0], c[1]),
+        )
 
     def _find_best_executable_route(
         self,
@@ -1351,9 +1475,16 @@ class BaselineSwapSolver(IntentSolver):
         Single-hop results are always executable (one router, one DEX)
         and pass through unchanged.
         """
+        intermediaries = self._intermediaries_for_chain(chain_id)
+        try:
+            return self._resolve_best_route(
+                pool_states, token_in, token_out, amount_in, chain_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - exact routing degrades to current baseline
+            logger.info("exact route resolution unavailable; falling back to pool math: %s", exc)
+
         from strategies.dex_aggregator.pool_math import find_best_route
 
-        intermediaries = self._intermediaries_for_chain(chain_id)
         unrestricted = find_best_route(
             pool_states, token_in, token_out, amount_in,
             intermediaries=intermediaries,
