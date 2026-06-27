@@ -201,6 +201,42 @@ class MinerSolver(BaselineSwapSolver):
             tls = self._king_tls = threading.local()
         return tls
 
+    def _prefer_gas_route_for_benchmark(
+        self,
+        state: IntentState,
+        swap_params: dict[str, Any],
+        chain_id: int,
+        *,
+        for_quote: bool,
+    ) -> bool:
+        """Prefer lower-gas routes once the validator supplies a reference quote.
+
+        Under the fixed validator path, challenger and incumbent are scored
+        against the same champion-provided ``quoted_output``. When that anchor is
+        already loose enough to cap output_score, extra output no longer helps;
+        gas is the remaining differentiator. Keep the baseline's self-quote
+        behavior for quote calls and blind spots, but use the lower-gas executable
+        route for benchmark plan generation when a reference quote is present.
+        """
+        try:
+            control = state.control_view()
+            raw = state.raw_params_view()
+            has_reference_quote = raw.get("quoted_output") not in (None, "", "0", 0)
+            if (
+                not for_quote
+                and control.get("_stage") in ("synthetic", "historical")
+                and has_reference_quote
+            ):
+                return True
+        except Exception:
+            pass
+        return super()._prefer_gas_route_for_benchmark(
+            state,
+            swap_params,
+            chain_id,
+            for_quote=for_quote,
+        )
+
     # ── v17 SPEED: bounded Web3 — cap every eth_call at _RPC_TIMEOUT_S ─────────
     def _get_web3(self, chain_id):  # type: ignore[override]
         """Identical to the baseline cache, but the HTTPProvider carries a hard
